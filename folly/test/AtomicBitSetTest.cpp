@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,12 @@
 
 #include <folly/AtomicBitSet.h>
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
-namespace folly { namespace test {
+#include <glog/logging.h>
+
+namespace folly {
+namespace test {
 
 TEST(AtomicBitSet, Simple) {
   constexpr size_t kSize = 1000;
@@ -52,9 +54,10 @@ TEST(AtomicBitSet, Simple) {
   }
 }
 
-}}  // namespaces
+} // namespace test
+} // namespace folly
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
   testing::InitGoogleTest(&argc, argv);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   return RUN_ALL_TESTS();

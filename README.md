@@ -1,32 +1,110 @@
 Folly: Facebook Open-source Library
 -----------------------------------
 
-Folly is an open-source C++ library developed and used at Facebook.
+[![Build Status](https://travis-ci.org/facebook/folly.svg?branch=master)](https://travis-ci.org/facebook/folly)
 
-###[Get Started](folly/docs/Overview.md)
+### What is `folly`?
 
-Folly is published on Github at https://github.com/facebook/folly; for
-discussions, there is a Google group at
-https://groups.google.com/d/forum/facebook-folly.
+Folly (acronymed loosely after Facebook Open Source Library) is a
+library of C++14 components designed with practicality and efficiency
+in mind. **Folly contains a variety of core library components used extensively
+at Facebook**. In particular, it's often a dependency of Facebook's other
+open source C++ efforts and place where those projects can share code.
 
-Dependencies
-------------
+It complements (as opposed to competing against) offerings
+such as Boost and of course `std`. In fact, we embark on defining our
+own component only when something we need is either not available, or
+does not meet the needed performance profile. We endeavor to remove
+things from folly if or when `std` or Boost obsoletes them.
 
-folly requires gcc 4.8+ and a version of boost compiled with C++11 support.
+Performance concerns permeate much of Folly, sometimes leading to
+designs that are more idiosyncratic than they would otherwise be (see
+e.g. `PackedSyncPtr.h`, `SmallLocks.h`). Good performance at large
+scale is a unifying theme in all of Folly.
 
-Please download googletest from
-https://googletest.googlecode.com/files/gtest-1.7.0.zip and unzip it in the
-folly/test subdirectory.
+### Logical Design
 
-Ubuntu 12.04
-------------
+Folly is a collection of relatively independent components, some as
+simple as a few symbols. There is no restriction on internal
+dependencies, meaning that a given folly module may use any other
+folly components.
 
-This release is old, requiring many upgrades. However, since Travis CI runs
-on 12.04, `folly/build/deps_ubuntu_12.04.sh` is provided, and upgrades all
-the required packages.
+All symbols are defined in the top-level namespace `folly`, except of
+course macros. Macro names are ALL_UPPERCASE and should be prefixed
+with `FOLLY_`. Namespace `folly` defines other internal namespaces
+such as `internal` or `detail`. User code should not depend on symbols
+in those namespaces.
 
-Ubuntu 13.10
-------------
+Folly has an `experimental` directory as well. This designation connotes
+primarily that we feel the API may change heavily over time. This code,
+typically, is still in heavy use and is well tested.
+
+### Physical Design
+
+At the top level Folly uses the classic "stuttering" scheme
+`folly/folly` used by Boost and others. The first directory serves as
+an installation root of the library (with possible versioning a la
+`folly-1.0/`), and the second is to distinguish the library when
+including files, e.g. `#include <folly/FBString.h>`.
+
+The directory structure is flat (mimicking the namespace structure),
+i.e. we don't have an elaborate directory hierarchy (it is possible
+this will change in future versions). The subdirectory `experimental`
+contains files that are used inside folly and possibly at Facebook but
+not considered stable enough for client use. Your code should not use
+files in `folly/experimental` lest it may break when you update Folly.
+
+The `folly/folly/test` subdirectory includes the unittests for all
+components, usually named `ComponentXyzTest.cpp` for each
+`ComponentXyz.*`. The `folly/folly/docs` directory contains
+documentation.
+
+### What's in it?
+
+Because of folly's fairly flat structure, the best way to see what's in it
+is to look at the headers in [top level `folly/` directory](https://github.com/facebook/folly/tree/master/folly). You can also
+check the [`docs` folder](folly/docs) for documentation, starting with the
+[overview](folly/docs/Overview.md).
+
+Folly is published on Github at https://github.com/facebook/folly
+
+### Build Notes
+
+#### Dependencies
+
+folly requires gcc 4.9+ and a version of boost compiled with C++14 support.
+
+googletest is required to build and run folly's tests.  You can download
+it from https://github.com/google/googletest/archive/release-1.8.0.tar.gz
+The following commands can be used to download and install it:
+
+```
+wget https://github.com/google/googletest/archive/release-1.8.0.tar.gz && \
+tar zxf release-1.8.0.tar.gz && \
+rm -f release-1.8.0.tar.gz && \
+cd googletest-release-1.8.0 && \
+cmake . && \
+make && \
+make install
+```
+
+#### Finding dependencies in non-default locations
+
+If you have boost, gtest, or other dependencies installed in a non-default
+location, you can use the `CMAKE_INCLUDE_PATH` and `CMAKE_LIBRARY_PATH`
+variables to make CMAKE look also look for header files and libraries in
+non-standard locations.  For example, to also search the directories
+`/alt/include/path1` and `/alt/include/path2` for header files and the
+directories `/alt/lib/path1` and `/alt/lib/path2` for libraries, you can invoke
+`cmake` as follows:
+
+```
+cmake \
+  -DCMAKE_INCLUDE_PATH=/alt/include/path1:/alt/include/path2 \
+  -DCMAKE_LIBRARY_PATH=/alt/lib/path1:/alt/lib/path2 ...
+```
+
+#### Ubuntu 16.04 LTS
 
 The following packages are required (feel free to cut and paste the apt-get
 command below):
@@ -34,15 +112,13 @@ command below):
 ```
 sudo apt-get install \
     g++ \
-    automake \
-    autoconf \
-    autoconf-archive \
-    libtool \
+    cmake \
     libboost-all-dev \
     libevent-dev \
     libdouble-conversion-dev \
     libgoogle-glog-dev \
     libgflags-dev \
+    libiberty-dev \
     liblz4-dev \
     liblzma-dev \
     libsnappy-dev \
@@ -50,32 +126,29 @@ sudo apt-get install \
     zlib1g-dev \
     binutils-dev \
     libjemalloc-dev \
-    libssl-dev
+    libssl-dev \
+    pkg-config
 ```
 
-Ubuntu 14.04 LTS
-----------------
-
-The packages listed above for Ubuntu 13.10 are required, as well as:
+If advanced debugging functionality is required, use:
 
 ```
 sudo apt-get install \
-    libiberty-dev
+    libunwind8-dev \
+    libelf-dev \
+    libdwarf-dev
 ```
 
-The above packages are sufficient for Ubuntu 13.10 and Ubuntu 14.04.
-
-In the folly directory, run
+In the folly directory (e.g. the checkout root or the archive unpack root), run:
 ```
-  autoreconf -ivf
-  ./configure
-  make
-  make check
-  sudo make install
+  mkdir _build && cd _build
+  cmake ..
+  make -j $(nproc)
+  make install # with either sudo or DESTDIR as necessary
 ```
 
-OS X (Homebrew)
-----
+#### OS X (Homebrew)
+
 folly is available as a Formula and releases may be built via `brew install folly`.
 
 You may also use `folly/build/bootstrap-osx-homebrew.sh` to build against `master`:
@@ -83,12 +156,10 @@ You may also use `folly/build/bootstrap-osx-homebrew.sh` to build against `maste
 ```
   cd folly
   ./build/bootstrap-osx-homebrew.sh
-  make
-  make check
 ```
 
-OS X (MacPorts)
-----
+#### OS X (MacPorts)
+
 Install the required packages from MacPorts:
 
 ```
@@ -129,27 +200,32 @@ Download and install folly with the parameters listed below:
   sudo make install
 ```
 
-Other Linux distributions
--------------------------
+#### Windows (Vcpkg)
+
+folly is available in [Vcpkg](https://github.com/Microsoft/vcpkg#vcpkg) and releases may be built via `vcpkg install folly:x64-windows`.
+
+You may also use `vcpkg install folly:x64-windows --head` to build against `master`.
+
+#### Other Linux distributions
 
 - double-conversion (https://github.com/google/double-conversion)
 
   Download and build double-conversion.
-  You may need to tell configure where to find it.
+  You may need to tell cmake where to find it.
 
   [double-conversion/] `ln -s src double-conversion`
 
-  [folly/] `./configure LDFLAGS=-L$DOUBLE_CONVERSION_HOME/ CPPFLAGS=-I$DOUBLE_CONVERSION_HOME/`
+  [folly/] `mkdir build && cd build`
+  [folly/build/] `cmake "-DCMAKE_INCLUDE_PATH=$DOUBLE_CONVERSION_HOME/include" "-DCMAKE_LIBRARY_PATH=$DOUBLE_CONVERSION_HOME/lib" ..`
 
-  [folly/] `LD_LIBRARY_PATH=$DOUBLE_CONVERSION_HOME/ make`
+  [folly/build/] `make`
 
 - additional platform specific dependencies:
 
-  Fedora 21 64-bit
+  Fedora >= 21 64-bit (last tested on Fedora 28 64-bit)
     - gcc
     - gcc-c++
-    - autoconf
-    - autoconf-archive
+    - cmake
     - automake
     - boost-devel
     - libtool
@@ -163,3 +239,8 @@ Other Linux distributions
     - double-conversion-devel
     - openssl-devel
     - libevent-devel
+
+  Optional
+    - libdwarf-dev
+    - libelf-dev
+    - libunwind8-dev

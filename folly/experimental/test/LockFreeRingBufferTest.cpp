@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2015-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,11 @@
  * limitations under the License.
  */
 
-#include <gflags/gflags.h>
-#include <gtest/gtest.h>
 #include <iostream>
 #include <thread>
 
-#include <folly/detail/Futex.h>
 #include <folly/experimental/LockFreeRingBuffer.h>
+#include <folly/portability/GTest.h>
 #include <folly/test/DeterministicSchedule.h>
 
 namespace folly {
@@ -33,14 +31,14 @@ TEST(LockFreeRingBuffer, writeReadSequentially) {
   LockFreeRingBuffer<int>::Cursor cur = rb.currentHead();
   for (unsigned int turn = 0; turn < turns; turn++) {
     for (unsigned int write = 0; write < capacity; write++) {
-      int val = turn*capacity + write;
+      int val = turn * capacity + write;
       rb.write(val);
     }
 
     for (unsigned int write = 0; write < capacity; write++) {
       int dest = 0;
       ASSERT_TRUE(rb.tryRead(dest, cur));
-      ASSERT_EQ(turn*capacity + write, dest);
+      ASSERT_EQ(turn * capacity + write, dest);
       cur.moveForward();
     }
   }
@@ -53,7 +51,7 @@ TEST(LockFreeRingBuffer, writeReadSequentiallyBackward) {
   LockFreeRingBuffer<int> rb(capacity);
   for (unsigned int turn = 0; turn < turns; turn++) {
     for (unsigned int write = 0; write < capacity; write++) {
-      int val = turn*capacity + write;
+      int val = turn * capacity + write;
       rb.write(val);
     }
 
@@ -62,7 +60,7 @@ TEST(LockFreeRingBuffer, writeReadSequentiallyBackward) {
     for (int write = capacity - 1; write >= 0; write--) {
       int foo = 0;
       ASSERT_TRUE(rb.tryRead(foo, cur));
-      ASSERT_EQ(turn*capacity + write, foo);
+      ASSERT_EQ(turn * capacity + write, foo);
       cur.moveBackward();
     }
   }
@@ -94,35 +92,31 @@ TEST(LockFreeRingBuffer, readsCanBlock) {
 }
 
 // expose the cursor raw value via a wrapper type
-template<typename T, template<typename> class Atom>
-uint64_t value(const typename LockFreeRingBuffer<T, Atom>::Cursor&& rbcursor) {
-  typedef typename LockFreeRingBuffer<T,Atom>::Cursor RBCursor;
-
-  RBCursor cursor = std::move(rbcursor);
+template <typename T, template <typename> class Atom>
+uint64_t value(const typename LockFreeRingBuffer<T, Atom>::Cursor& rbcursor) {
+  typedef typename LockFreeRingBuffer<T, Atom>::Cursor RBCursor;
 
   struct ExposedCursor : RBCursor {
-    ExposedCursor(const RBCursor& cursor): RBCursor(cursor) {}
-    uint64_t value(){
+    ExposedCursor(const RBCursor& cursor) : RBCursor(cursor) {}
+    uint64_t value() {
       return this->ticket;
     }
   };
-  return ExposedCursor(cursor).value();
+  return ExposedCursor(rbcursor).value();
 }
 
-template<template<typename> class Atom>
+template <template <typename> class Atom>
 void runReader(
-    LockFreeRingBuffer<int, Atom>& rb, std::atomic<int32_t>& writes
-) {
+    LockFreeRingBuffer<int, Atom>& rb,
+    std::atomic<int32_t>& writes) {
   int32_t idx;
   while ((idx = writes--) > 0) {
     rb.write(idx);
   }
 }
 
-template<template<typename> class Atom>
-void runWritesNeverFail(
-    int capacity, int writes, int writers
-) {
+template <template <typename> class Atom>
+void runWritesNeverFail(int capacity, int writes, int writers) {
   using folly::test::DeterministicSchedule;
 
   DeterministicSchedule sched(DeterministicSchedule::uniform(0));
@@ -133,8 +127,7 @@ void runWritesNeverFail(
 
   for (int i = 0; i < writers; i++) {
     threads[i] = DeterministicSchedule::thread(
-        std::bind(runReader<Atom>, std::ref(rb), std::ref(writes_remaining))
-    );
+        std::bind(runReader<Atom>, std::ref(rb), std::ref(writes_remaining)));
   }
 
   for (auto& thread : threads) {
@@ -145,8 +138,8 @@ void runWritesNeverFail(
 }
 
 TEST(LockFreeRingBuffer, writesNeverFail) {
-  using folly::test::DeterministicAtomic;
   using folly::detail::EmulatedFutexAtomic;
+  using folly::test::DeterministicAtomic;
 
   runWritesNeverFail<DeterministicAtomic>(1, 100, 4);
   runWritesNeverFail<DeterministicAtomic>(10, 100, 4);
@@ -193,7 +186,6 @@ TEST(LockFreeRingBuffer, readerCanDetectSkips) {
   EXPECT_EQ((capacity * rounds) - 1, result);
 }
 
-
 TEST(LockFreeRingBuffer, currentTailRange) {
   const int capacity = 4;
   LockFreeRingBuffer<int> rb(capacity);
@@ -224,6 +216,83 @@ TEST(LockFreeRingBuffer, currentTailRange) {
   auto midvalue = cursorValue(rb.currentTail(0.5));
   // both rounding behaviours are acceptable
   EXPECT_TRUE(midvalue == 1 || midvalue == 2);
+}
+
+TEST(LockFreeRingBuffer, cursorFromWrites) {
+  const int capacity = 3;
+  LockFreeRingBuffer<int> rb(capacity);
+
+  // Workaround for template deduction failure
+  auto (&cursorValue)(value<int, std::atomic>);
+
+  int val = 0xfaceb00c;
+  EXPECT_EQ(0, cursorValue(rb.writeAndGetCursor(val)));
+  EXPECT_EQ(1, cursorValue(rb.writeAndGetCursor(val)));
+  EXPECT_EQ(2, cursorValue(rb.writeAndGetCursor(val)));
+
+  // Check that rb is giving out actual cursors and not just
+  // pointing to the current slot.
+  EXPECT_EQ(3, cursorValue(rb.writeAndGetCursor(val)));
+}
+
+TEST(LockFreeRingBuffer, moveBackwardsCanFail) {
+  const int capacity = 3;
+  LockFreeRingBuffer<int> rb(capacity);
+
+  // Workaround for template deduction failure
+  auto (&cursorValue)(value<int, std::atomic>);
+
+  int val = 0xfaceb00c;
+  rb.write(val);
+  rb.write(val);
+
+  auto cursor = rb.currentHead(); // points to 2
+  EXPECT_EQ(2, cursorValue(cursor));
+  EXPECT_TRUE(cursor.moveBackward());
+  EXPECT_TRUE(cursor.moveBackward()); // now at 0
+  EXPECT_FALSE(cursor.moveBackward()); // moving back does nothing
+}
+
+TEST(LockFreeRingBuffer, writeReadDifferentType) {
+  struct FixedBuffer {
+    char data_[1024];
+
+    FixedBuffer() noexcept {
+      data_[0] = '\0';
+    }
+
+    FixedBuffer& operator=(std::string&& data) {
+      strncpy(data_, data.c_str(), sizeof(data_) - 1);
+
+      return (*this);
+    }
+  };
+
+  struct StringBuffer {
+    char data_[1024];
+
+    StringBuffer() noexcept {
+      data_[0] = '\0';
+    }
+
+    StringBuffer& operator=(FixedBuffer& data) {
+      strncpy(data_, data.data_, sizeof(data_) - 1);
+
+      return (*this);
+    }
+  };
+
+  std::string str("Test");
+
+  const int capacity = 3;
+  LockFreeRingBuffer<FixedBuffer> rb(capacity);
+  rb.write(str);
+
+  auto cursor = rb.currentTail();
+  StringBuffer result;
+  EXPECT_TRUE(rb.tryRead(result, cursor));
+
+  EXPECT_EQ(str, result.data_);
 }
 
 } // namespace folly

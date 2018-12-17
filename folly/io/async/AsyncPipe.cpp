@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2014-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@
 #include <folly/FileUtil.h>
 #include <folly/io/async/AsyncSocketException.h>
 
-using std::string;
-using std::unique_ptr;
 using folly::IOBuf;
 using folly::IOBufQueue;
+using std::string;
+using std::unique_ptr;
 
 namespace folly {
 
@@ -30,8 +30,8 @@ AsyncPipeReader::~AsyncPipeReader() {
 }
 
 void AsyncPipeReader::failRead(const AsyncSocketException& ex) {
-  VLOG(5) << "AsyncPipeReader(this=" << this << ", fd=" << fd_ <<
-    "): failed while reading: " << ex.what();
+  VLOG(5) << "AsyncPipeReader(this=" << this << ", fd=" << fd_
+          << "): failed while reading: " << ex.what();
 
   DCHECK(readCallback_ != nullptr);
   AsyncReader::ReadCallback* callback = readCallback_;
@@ -43,7 +43,7 @@ void AsyncPipeReader::failRead(const AsyncSocketException& ex) {
 void AsyncPipeReader::close() {
   unregisterHandler();
   if (fd_ >= 0) {
-    changeHandlerFD(-1);
+    changeHandlerFD(folly::NetworkSocket::fromFd(-1));
 
     if (closeCb_) {
       closeCb_(fd_);
@@ -62,36 +62,57 @@ void AsyncPipeReader::handlerReady(uint16_t events) noexcept {
   assert(readCallback_ != nullptr);
 
   while (readCallback_) {
+    // - What API does callback support?
+    const auto movable = readCallback_->isBufferMovable(); // noexcept
+
     // Get the buffer to read into.
     void* buf = nullptr;
     size_t buflen = 0;
-    try {
-      readCallback_->getReadBuffer(&buf, &buflen);
-    } catch (const std::exception& ex) {
-      AsyncSocketException aex(AsyncSocketException::BAD_ARGS,
-                               string("ReadCallback::getReadBuffer() "
-                                      "threw exception: ") + ex.what());
-      failRead(aex);
-      return;
-    } catch (...) {
-      AsyncSocketException ex(AsyncSocketException::BAD_ARGS,
-                              string("ReadCallback::getReadBuffer() "
-                                     "threw non-exception type"));
-      failRead(ex);
-      return;
-    }
-    if (buf == nullptr || buflen == 0) {
-      AsyncSocketException ex(AsyncSocketException::INVALID_STATE,
-                              string("ReadCallback::getReadBuffer() "
-                                     "returned empty buffer"));
-      failRead(ex);
-      return;
+    std::unique_ptr<IOBuf> ioBuf;
+
+    if (movable) {
+      ioBuf = IOBuf::create(readCallback_->maxBufferSize());
+      buf = ioBuf->writableBuffer();
+      buflen = ioBuf->capacity();
+    } else {
+      try {
+        readCallback_->getReadBuffer(&buf, &buflen);
+      } catch (const std::exception& ex) {
+        AsyncSocketException aex(
+            AsyncSocketException::BAD_ARGS,
+            string("ReadCallback::getReadBuffer() "
+                   "threw exception: ") +
+                ex.what());
+        failRead(aex);
+        return;
+      } catch (...) {
+        AsyncSocketException aex(
+            AsyncSocketException::BAD_ARGS,
+            string("ReadCallback::getReadBuffer() "
+                   "threw non-exception type"));
+        failRead(aex);
+        return;
+      }
+      if (buf == nullptr || buflen == 0) {
+        AsyncSocketException aex(
+            AsyncSocketException::INVALID_STATE,
+            string("ReadCallback::getReadBuffer() "
+                   "returned empty buffer"));
+        failRead(aex);
+        return;
+      }
     }
 
     // Perform the read
     ssize_t bytesRead = folly::readNoInt(fd_, buf, buflen);
+
     if (bytesRead > 0) {
-      readCallback_->readDataAvailable(bytesRead);
+      if (movable) {
+        ioBuf->append(std::size_t(bytesRead));
+        readCallback_->readBufferAvailable(std::move(ioBuf));
+      } else {
+        readCallback_->readDataAvailable(size_t(bytesRead));
+      }
       // Fall through and continue around the loop if the read
       // completely filled the available buffer.
       // Note that readCallback_ may have been uninstalled or changed inside
@@ -103,8 +124,8 @@ void AsyncPipeReader::handlerReady(uint16_t events) noexcept {
       // No more data to read right now.
       return;
     } else if (bytesRead < 0) {
-      AsyncSocketException ex(AsyncSocketException::INVALID_STATE,
-                              "read failed", errno);
+      AsyncSocketException ex(
+          AsyncSocketException::INVALID_STATE, "read failed", errno);
       failRead(ex);
       return;
     } else {
@@ -121,13 +142,13 @@ void AsyncPipeReader::handlerReady(uint16_t events) noexcept {
   }
 }
 
-
-void AsyncPipeWriter::write(unique_ptr<folly::IOBuf> buf,
-                            AsyncWriter::WriteCallback* callback) {
+void AsyncPipeWriter::write(
+    unique_ptr<folly::IOBuf> buf,
+    AsyncWriter::WriteCallback* callback) {
   if (closed()) {
     if (callback) {
-      AsyncSocketException ex(AsyncSocketException::NOT_OPEN,
-                              "attempt to write to closed pipe");
+      AsyncSocketException ex(
+          AsyncSocketException::NOT_OPEN, "attempt to write to closed pipe");
       callback->writeErr(0, ex);
     }
     return;
@@ -136,9 +157,9 @@ void AsyncPipeWriter::write(unique_ptr<folly::IOBuf> buf,
   folly::IOBufQueue iobq;
   iobq.append(std::move(buf));
   std::pair<folly::IOBufQueue, AsyncWriter::WriteCallback*> p(
-    std::move(iobq), callback);
+      std::move(iobq), callback);
   queue_.emplace_back(std::move(p));
-  if (wasEmpty)  {
+  if (wasEmpty) {
     handleWrite();
   } else {
     CHECK(!queue_.empty());
@@ -146,9 +167,10 @@ void AsyncPipeWriter::write(unique_ptr<folly::IOBuf> buf,
   }
 }
 
-void AsyncPipeWriter::writeChain(folly::AsyncWriter::WriteCallback* callback,
-                                 std::unique_ptr<folly::IOBuf>&& buf,
-                                 WriteFlags) {
+void AsyncPipeWriter::writeChain(
+    folly::AsyncWriter::WriteCallback* callback,
+    std::unique_ptr<folly::IOBuf>&& buf,
+    WriteFlags) {
   write(std::move(buf), callback);
 }
 
@@ -165,12 +187,12 @@ void AsyncPipeWriter::closeOnEmpty() {
 void AsyncPipeWriter::closeNow() {
   VLOG(5) << "close now";
   if (!queue_.empty()) {
-    failAllWrites(AsyncSocketException(AsyncSocketException::NOT_OPEN,
-                                       "closed with pending writes"));
+    failAllWrites(AsyncSocketException(
+        AsyncSocketException::NOT_OPEN, "closed with pending writes"));
   }
   if (fd_ >= 0) {
     unregisterHandler();
-    changeHandlerFD(-1);
+    changeHandlerFD(folly::NetworkSocket::fromFd(-1));
     if (closeCb_) {
       closeCb_(fd_);
     } else {
@@ -192,7 +214,6 @@ void AsyncPipeWriter::failAllWrites(const AsyncSocketException& ex) {
   }
 }
 
-
 void AsyncPipeWriter::handlerReady(uint16_t events) noexcept {
   CHECK(events & EventHandler::WRITE);
 
@@ -204,7 +225,7 @@ void AsyncPipeWriter::handleWrite() {
   assert(!queue_.empty());
   do {
     auto& front = queue_.front();
-    folly::IOBufQueue &curQueue = front.first;
+    folly::IOBufQueue& curQueue = front.first;
     DCHECK(!curQueue.empty());
     // someday, support writev.  The logic for partial writes is a bit complex
     const IOBuf* head = curQueue.front();
@@ -217,8 +238,8 @@ void AsyncPipeWriter::handleWrite() {
         registerHandler(EventHandler::WRITE);
         return;
       } else {
-        failAllWrites(AsyncSocketException(AsyncSocketException::INTERNAL_ERROR,
-                                           "write failed", errno));
+        failAllWrites(AsyncSocketException(
+            AsyncSocketException::INTERNAL_ERROR, "write failed", errno));
         closeNow();
         return;
       }
@@ -226,7 +247,7 @@ void AsyncPipeWriter::handleWrite() {
       registerHandler(EventHandler::WRITE);
       return;
     }
-    curQueue.trimStart(rc);
+    curQueue.trimStart(size_t(rc));
     if (curQueue.empty()) {
       auto cb = front.second;
       queue_.pop_front();
@@ -245,4 +266,4 @@ void AsyncPipeWriter::handleWrite() {
   }
 }
 
-} // folly
+} // namespace folly

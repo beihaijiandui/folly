@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2015-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,16 @@
 
 #include <folly/Demangle.h>
 
-#include <gflags/gflags.h>
-#include <gtest/gtest.h>
+#include <folly/detail/Demangle.h>
+#include <folly/portability/GTest.h>
 
 using folly::demangle;
 
 namespace folly_test {
-struct ThisIsAVeryLongStructureName {
-};
-}  // namespace folly_test
+struct ThisIsAVeryLongStructureName {};
+} // namespace folly_test
 
-#if FOLLY_HAVE_CPLUS_DEMANGLE_V3_CALLBACK
+#if FOLLY_DETAIL_HAVE_DEMANGLE_H
 TEST(Demangle, demangle) {
   char expected[] = "folly_test::ThisIsAVeryLongStructureName";
   EXPECT_STREQ(
@@ -35,18 +34,57 @@ TEST(Demangle, demangle) {
 
   {
     char buf[sizeof(expected)];
-    EXPECT_EQ(sizeof(expected) - 1,
-              demangle(typeid(folly_test::ThisIsAVeryLongStructureName),
-                       buf, sizeof(buf)));
+    EXPECT_EQ(
+        sizeof(expected) - 1,
+        demangle(
+            typeid(folly_test::ThisIsAVeryLongStructureName),
+            buf,
+            sizeof(buf)));
     EXPECT_STREQ(expected, buf);
 
-    EXPECT_EQ(sizeof(expected) - 1,
-              demangle(typeid(folly_test::ThisIsAVeryLongStructureName),
-                       buf, 11));
+    EXPECT_EQ(
+        sizeof(expected) - 1,
+        demangle(typeid(folly_test::ThisIsAVeryLongStructureName), buf, 11));
     EXPECT_STREQ("folly_test", buf);
   }
 }
-#endif
+
+#if defined(FOLLY_DEMANGLE_MAX_SYMBOL_SIZE)
+namespace {
+
+template <int I, class T1, class T2>
+struct Node {};
+
+template <int N, int I = 1>
+struct LongSymbol {
+  using arg1 = typename LongSymbol<N / 2, 2 * I>::type;
+  using arg2 = typename LongSymbol<N / 2, 2 * I + 1>::type;
+  using type = Node<I, arg1, arg2>;
+};
+
+template <int I>
+struct LongSymbol<0, I> {
+  using type = void;
+};
+
+} // namespace
+
+TEST(Demangle, LongSymbolFallback) {
+  // The symbol must be at least FOLLY_DEMANGLE_MAX_SYMBOL_SIZE long.
+  using Symbol = LongSymbol<FOLLY_DEMANGLE_MAX_SYMBOL_SIZE>::type;
+  auto name = typeid(Symbol).name();
+
+  EXPECT_STREQ(name, demangle(name).c_str());
+
+  char buf[16];
+  char expected[16];
+  folly::demangle(name, buf, 16);
+  folly::strlcpy(expected, name, 16);
+  EXPECT_STREQ(expected, buf);
+}
+#endif // defined(FOLLY_DEMANGLE_MAX_SYMBOL_SIZE)
+
+#endif // FOLLY_DETAIL_HAVE_DEMANGLE_H
 
 TEST(Demangle, strlcpy) {
   char buf[6];
@@ -67,11 +105,5 @@ TEST(Demangle, strlcpy) {
 
   buf[0] = 'z';
   EXPECT_EQ(strlen(big_string), folly::strlcpy(buf, big_string, 0));
-  EXPECT_EQ('z', buf[0]);  // unchanged, size = 0
-}
-
-int main(int argc, char *argv[]) {
-  testing::InitGoogleTest(&argc, argv);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
-  return RUN_ALL_TESTS();
+  EXPECT_EQ('z', buf[0]); // unchanged, size = 0
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2011-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,26 +16,34 @@
 
 #include <folly/ThreadLocal.h>
 
-#include <sys/types.h>
+#ifndef _WIN32
+#include <dlfcn.h>
 #include <sys/wait.h>
-#include <unistd.h>
+#endif
+
+#include <sys/types.h>
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
 #include <unordered_map>
 
-#include <boost/thread/tss.hpp>
-#include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <gtest/gtest.h>
 
-#include <folly/Benchmark.h>
+#include <folly/Memory.h>
+#include <folly/experimental/io/FsUtil.h>
+#include <folly/portability/GTest.h>
+#include <folly/portability/Unistd.h>
+#include <folly/synchronization/Baton.h>
+#include <folly/synchronization/detail/ThreadCachedInts.h>
+#include <folly/system/ThreadId.h>
 
 using namespace folly;
 
@@ -47,19 +55,37 @@ struct Widget {
   }
 
   static void customDeleter(Widget* w, TLPDestructionMode mode) {
-    totalVal_ += (mode == TLPDestructionMode::ALL_THREADS) * 1000;
+    totalVal_ += (mode == TLPDestructionMode::ALL_THREADS) ? 1000 : 1;
     delete w;
   }
 };
 int Widget::totalVal_ = 0;
 
+struct MultiWidget {
+  int val_{0};
+  MultiWidget() = default;
+  ~MultiWidget() {
+    // force a reallocation in the destructor by
+    // allocating more than elementsCapacity
+
+    using TL = ThreadLocal<size_t>;
+    using TLMeta = threadlocal_detail::static_meta_of<TL>::type;
+    auto const numElements = TLMeta::instance().elementsCapacity() + 1;
+    std::vector<ThreadLocal<size_t>> elems(numElements);
+    for (auto& t : elems) {
+      *t += 1;
+    }
+  }
+};
+
 TEST(ThreadLocalPtr, BasicDestructor) {
   Widget::totalVal_ = 0;
   ThreadLocalPtr<Widget> w;
   std::thread([&w]() {
-      w.reset(new Widget());
-      w.get()->val_ += 10;
-    }).join();
+    w.reset(new Widget());
+    w.get()->val_ += 10;
+  })
+      .join();
   EXPECT_EQ(10, Widget::totalVal_);
 }
 
@@ -68,9 +94,43 @@ TEST(ThreadLocalPtr, CustomDeleter1) {
   {
     ThreadLocalPtr<Widget> w;
     std::thread([&w]() {
-        w.reset(new Widget(), Widget::customDeleter);
-        w.get()->val_ += 10;
-      }).join();
+      w.reset(new Widget(), Widget::customDeleter);
+      w.get()->val_ += 10;
+    })
+        .join();
+    EXPECT_EQ(11, Widget::totalVal_);
+  }
+  EXPECT_EQ(11, Widget::totalVal_);
+}
+
+TEST(ThreadLocalPtr, CustomDeleterOwnershipTransfer) {
+  Widget::totalVal_ = 0;
+  {
+    ThreadLocalPtr<Widget> w;
+    auto deleter = [](Widget* ptr) {
+      Widget::customDeleter(ptr, TLPDestructionMode::THIS_THREAD);
+    };
+    std::unique_ptr<Widget, decltype(deleter)> source(new Widget(), deleter);
+    std::thread([&w, &source]() {
+      w.reset(std::move(source));
+      w.get()->val_ += 10;
+    })
+        .join();
+    EXPECT_EQ(11, Widget::totalVal_);
+  }
+  EXPECT_EQ(11, Widget::totalVal_);
+}
+
+TEST(ThreadLocalPtr, DefaultDeleterOwnershipTransfer) {
+  Widget::totalVal_ = 0;
+  {
+    ThreadLocalPtr<Widget> w;
+    auto source = std::make_unique<Widget>();
+    std::thread([&w, &source]() {
+      w.reset(std::move(source));
+      w.get()->val_ += 10;
+    })
+        .join();
     EXPECT_EQ(10, Widget::totalVal_);
   }
   EXPECT_EQ(10, Widget::totalVal_);
@@ -91,11 +151,12 @@ TEST(ThreadLocalPtr, TestRelease) {
   ThreadLocalPtr<Widget> w;
   std::unique_ptr<Widget> wPtr;
   std::thread([&w, &wPtr]() {
-      w.reset(new Widget());
-      w.get()->val_ += 10;
+    w.reset(new Widget());
+    w.get()->val_ += 10;
 
-      wPtr.reset(w.release());
-    }).join();
+    wPtr.reset(w.release());
+  })
+      .join();
   EXPECT_EQ(0, Widget::totalVal_);
   wPtr.reset();
   EXPECT_EQ(10, Widget::totalVal_);
@@ -107,14 +168,15 @@ TEST(ThreadLocalPtr, CreateOnThreadExit) {
   ThreadLocalPtr<int> tl;
 
   std::thread([&] {
-      tl.reset(new int(1), [&] (int* ptr, TLPDestructionMode mode) {
-        delete ptr;
-        // This test ensures Widgets allocated here are not leaked.
-        ++w.get()->val_;
-        ThreadLocal<Widget> wl;
-        ++wl.get()->val_;
-      });
-    }).join();
+    tl.reset(new int(1), [&](int* ptr, TLPDestructionMode /* mode */) {
+      delete ptr;
+      // This test ensures Widgets allocated here are not leaked.
+      ++w.get()->val_;
+      ThreadLocal<Widget> wl;
+      ++wl.get()->val_;
+    });
+  })
+      .join();
   EXPECT_EQ(2, Widget::totalVal_);
 }
 
@@ -127,29 +189,29 @@ TEST(ThreadLocalPtr, CustomDeleter2) {
   enum class State {
     START,
     DONE,
-    EXIT
+    EXIT,
   };
   State state = State::START;
   {
     ThreadLocalPtr<Widget> w;
     t = std::thread([&]() {
-        w.reset(new Widget(), Widget::customDeleter);
-        w.get()->val_ += 10;
+      w.reset(new Widget(), Widget::customDeleter);
+      w.get()->val_ += 10;
 
-        // Notify main thread that we're done
-        {
-          std::unique_lock<std::mutex> lock(mutex);
-          state = State::DONE;
-          cv.notify_all();
-        }
+      // Notify main thread that we're done
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        state = State::DONE;
+        cv.notify_all();
+      }
 
-        // Wait for main thread to allow us to exit
-        {
-          std::unique_lock<std::mutex> lock(mutex);
-          while (state != State::EXIT) {
-            cv.wait(lock);
-          }
+      // Wait for main thread to allow us to exit
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (state != State::EXIT) {
+          cv.wait(lock);
         }
+      }
     });
 
     // Wait for main thread to start (and set w.get()->val_)
@@ -184,6 +246,12 @@ TEST(ThreadLocal, BasicDestructor) {
   ThreadLocal<Widget> w;
   std::thread([&w]() { w->val_ += 10; }).join();
   EXPECT_EQ(10, Widget::totalVal_);
+}
+
+// this should force a realloc of the ElementWrapper array
+TEST(ThreadLocal, ReallocDestructor) {
+  ThreadLocal<MultiWidget> w;
+  std::thread([&w]() { w->val_ += 10; }).join();
 }
 
 TEST(ThreadLocal, SimpleRepeatDestructor) {
@@ -226,12 +294,12 @@ TEST(ThreadLocal, InterleavedDestructors) {
       ++thIter;
     }
   });
-  FOR_EACH_RANGE(i, 0, wVersionMax) {
+  FOR_EACH_RANGE (i, 0, wVersionMax) {
     int thIterPrev = 0;
     {
       std::lock_guard<std::mutex> g(lock);
       thIterPrev = thIter;
-      w.reset(new ThreadLocal<Widget>());
+      w = std::make_unique<ThreadLocal<Widget>>();
       ++wVersion;
     }
     while (true) {
@@ -250,9 +318,8 @@ TEST(ThreadLocal, InterleavedDestructors) {
 }
 
 class SimpleThreadCachedInt {
-
   class NewTag;
-  ThreadLocal<int,NewTag> val_;
+  ThreadLocal<int, NewTag> val_;
 
  public:
   void add(int val) {
@@ -269,20 +336,34 @@ class SimpleThreadCachedInt {
 };
 
 TEST(ThreadLocalPtr, AccessAllThreadsCounter) {
-  const int kNumThreads = 10;
-  SimpleThreadCachedInt stci;
+  const int kNumThreads = 256;
+  SimpleThreadCachedInt stci[kNumThreads + 1];
   std::atomic<bool> run(true);
-  std::atomic<int> totalAtomic(0);
+  std::atomic<int> totalAtomic{0};
   std::vector<std::thread> threads;
+  // thread i will increment all the thread locals
+  // in the range 0..i
   for (int i = 0; i < kNumThreads; ++i) {
-    threads.push_back(std::thread([&,i]() {
-      stci.add(1);
+    threads.push_back(std::thread([i, // i needs to be captured by value
+                                   &stci,
+                                   &run,
+                                   &totalAtomic]() {
+      for (int j = 0; j <= i; j++) {
+        stci[j].add(1);
+      }
+
       totalAtomic.fetch_add(1);
-      while (run.load()) { usleep(100); }
+      while (run.load()) {
+        usleep(100);
+      }
     }));
   }
-  while (totalAtomic.load() != kNumThreads) { usleep(100); }
-  EXPECT_EQ(kNumThreads, stci.read());
+  while (totalAtomic.load() != kNumThreads) {
+    usleep(100);
+  }
+  for (int i = 0; i <= kNumThreads; i++) {
+    EXPECT_EQ(kNumThreads - i, stci[i].read());
+  }
   run.store(false);
   for (auto& t : threads) {
     t.join();
@@ -305,7 +386,7 @@ struct Tag {};
 struct Foo {
   folly::ThreadLocal<int, Tag> tl;
 };
-}  // namespace
+} // namespace
 
 TEST(ThreadLocal, Movable1) {
   Foo a;
@@ -332,6 +413,39 @@ TEST(ThreadLocal, Movable2) {
 
   // Make sure that we have 4 different instances of *tl
   EXPECT_EQ(4, tls.size());
+}
+
+namespace {
+class ThreadCachedIntWidget {
+ public:
+  ThreadCachedIntWidget() {}
+
+  ~ThreadCachedIntWidget() {
+    if (ints_) {
+      ints_->increment(0);
+    }
+  }
+
+  void set(detail::ThreadCachedInts<void>* ints) {
+    ints_ = ints;
+  }
+
+ private:
+  detail::ThreadCachedInts<void>* ints_{nullptr};
+};
+} // namespace
+
+TEST(ThreadLocal, TCICreateOnThreadExit) {
+  detail::ThreadCachedInts<void> ints;
+  ThreadLocal<ThreadCachedIntWidget> w;
+
+  std::thread([&] {
+    // make sure the ints object is created
+    ints.increment(1);
+    // now the widget
+    w->set(&ints);
+  })
+      .join();
 }
 
 namespace {
@@ -368,27 +482,26 @@ class FillObject {
 
  private:
   uint64_t val() const {
-    return (idx_ << 40) | uint64_t(pthread_self());
+    return (idx_ << 40) | folly::getCurrentThreadID();
   }
 
   uint64_t idx_;
   uint64_t data_[kFillObjectSize];
 };
 
-}  // namespace
+} // namespace
 
-#if FOLLY_HAVE_STD_THIS_THREAD_SLEEP_FOR
 TEST(ThreadLocal, Stress) {
-  constexpr size_t numFillObjects = 250;
+  static constexpr size_t numFillObjects = 250;
   std::array<ThreadLocalPtr<FillObject>, numFillObjects> objects;
 
-  constexpr size_t numThreads = 32;
-  constexpr size_t numReps = 20;
+  static constexpr size_t numThreads = 32;
+  static constexpr size_t numReps = 20;
 
   std::vector<std::thread> threads;
   threads.reserve(numThreads);
 
-  for (size_t i = 0; i < numThreads; ++i) {
+  for (size_t k = 0; k < numThreads; ++k) {
     threads.emplace_back([&objects] {
       for (size_t rep = 0; rep < numReps; ++rep) {
         for (size_t i = 0; i < objects.size(); ++i) {
@@ -408,7 +521,6 @@ TEST(ThreadLocal, Stress) {
 
   EXPECT_EQ(numFillObjects * numThreads * numReps, gDestroyed);
 }
-#endif
 
 // Yes, threads and fork don't mix
 // (http://cppwisdom.quora.com/Why-threads-and-fork-dont-mix) but if you're
@@ -416,9 +528,12 @@ TEST(ThreadLocal, Stress) {
 namespace {
 class HoldsOne {
  public:
-  HoldsOne() : value_(1) { }
+  HoldsOne() : value_(1) {}
   // Do an actual access to catch the buggy case where this == nullptr
-  int value() const { return value_; }
+  int value() const {
+    return value_;
+  }
+
  private:
   int value_;
 };
@@ -435,11 +550,11 @@ int totalValue() {
   return value;
 }
 
-}  // namespace
+} // namespace
 
 #ifdef FOLLY_HAVE_PTHREAD_ATFORK
 TEST(ThreadLocal, Fork) {
-  EXPECT_EQ(1, ptr->value());  // ensure created
+  EXPECT_EQ(1, ptr->value()); // ensure created
   EXPECT_EQ(1, totalValue());
   // Spawn a new thread
 
@@ -449,8 +564,8 @@ TEST(ThreadLocal, Fork) {
   bool stopped = false;
   std::condition_variable stoppedCond;
 
-  std::thread t([&] () {
-    EXPECT_EQ(1, ptr->value());  // ensure created
+  std::thread t([&]() {
+    EXPECT_EQ(1, ptr->value()); // ensure created
     {
       std::unique_lock<std::mutex> lock(mutex);
       started = true;
@@ -481,8 +596,10 @@ TEST(ThreadLocal, Fork) {
     // exit successfully if v == 1 (one thread)
     // diagnostic error code otherwise :)
     switch (v) {
-    case 1: _exit(0);
-    case 0: _exit(1);
+      case 1:
+        _exit(0);
+      case 0:
+        _exit(1);
     }
     _exit(2);
   } else if (pid > 0) {
@@ -492,7 +609,7 @@ TEST(ThreadLocal, Fork) {
     EXPECT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
   } else {
-    EXPECT_TRUE(false) << "fork failed";
+    ADD_FAILURE() << "fork failed";
   }
 
   EXPECT_EQ(2, totalValue());
@@ -509,6 +626,7 @@ TEST(ThreadLocal, Fork) {
 }
 #endif
 
+#ifndef _WIN32
 struct HoldsOneTag2 {};
 
 TEST(ThreadLocal, Fork2) {
@@ -534,79 +652,79 @@ TEST(ThreadLocal, Fork2) {
     EXPECT_TRUE(WIFEXITED(status));
     EXPECT_EQ(0, WEXITSTATUS(status));
   } else {
-    EXPECT_TRUE(false) << "fork failed";
+    ADD_FAILURE() << "fork failed";
   }
 }
 
-// Simple reference implementation using pthread_get_specific
-template<typename T>
-class PThreadGetSpecific {
- public:
-  PThreadGetSpecific() : key_(0) {
-    pthread_key_create(&key_, OnThreadExit);
-  }
+// Disable the SharedLibrary test when using any sanitizer. Otherwise, the
+// dlopen'ed code would end up running without e.g., ASAN-initialized data
+// structures and failing right away.
+//
+// We also cannot run this test unless folly was compiled with PIC support,
+// since we cannot build thread_local_test_lib.so without PIC.
+#if defined FOLLY_SANITIZE_ADDRESS || defined FOLLY_SANITIZE_THREAD || \
+    !defined FOLLY_SUPPORT_SHARED_LIBRARY
+#define SHARED_LIBRARY_TEST_NAME DISABLED_SharedLibrary
+#else
+#define SHARED_LIBRARY_TEST_NAME SharedLibrary
+#endif
 
-  T* get() const {
-    return static_cast<T*>(pthread_getspecific(key_));
-  }
+TEST(ThreadLocal, SHARED_LIBRARY_TEST_NAME) {
+  auto exe = fs::executable_path();
+  auto lib = exe.parent_path() / "thread_local_test_lib.so";
+  auto handle = dlopen(lib.string().c_str(), RTLD_LAZY);
+  ASSERT_NE(nullptr, handle)
+      << "unable to load " << lib.string() << ": " << dlerror();
 
-  void reset(T* t) {
-    delete get();
-    pthread_setspecific(key_, t);
-  }
-  static void OnThreadExit(void* obj) {
-    delete static_cast<T*>(obj);
-  }
- private:
-  pthread_key_t key_;
+  typedef void (*useA_t)();
+  dlerror();
+  useA_t useA = (useA_t)dlsym(handle, "useA");
+
+  const char* dlsym_error = dlerror();
+  EXPECT_EQ(nullptr, dlsym_error);
+  ASSERT_NE(nullptr, useA);
+
+  useA();
+
+  folly::Baton<> b11, b12, b21, b22;
+
+  std::thread t1([&]() {
+    useA();
+    b11.post();
+    b12.wait();
+  });
+
+  std::thread t2([&]() {
+    useA();
+    b21.post();
+    b22.wait();
+  });
+
+  b11.wait();
+  b21.wait();
+
+  dlclose(handle);
+
+  b12.post();
+  b22.post();
+
+  t1.join();
+  t2.join();
+}
+
+#endif
+
+namespace folly {
+namespace threadlocal_detail {
+struct PthreadKeyUnregisterTester {
+  PthreadKeyUnregister p;
+  constexpr PthreadKeyUnregisterTester() = default;
 };
+} // namespace threadlocal_detail
+} // namespace folly
 
-DEFINE_int32(numThreads, 8, "Number simultaneous threads for benchmarks.");
-
-#define REG(var)                                                \
-  BENCHMARK(FB_CONCATENATE(BM_mt_, var), iters) {               \
-    const int itersPerThread = iters / FLAGS_numThreads;        \
-    std::vector<std::thread> threads;                           \
-    for (int i = 0; i < FLAGS_numThreads; ++i) {                \
-      threads.push_back(std::thread([&]() {                     \
-        var.reset(new int(0));                                  \
-        for (int i = 0; i < itersPerThread; ++i) {              \
-          ++(*var.get());                                       \
-        }                                                       \
-      }));                                                      \
-    }                                                           \
-    for (auto& t : threads) {                                   \
-      t.join();                                                 \
-    }                                                           \
-  }
-
-ThreadLocalPtr<int> tlp;
-REG(tlp);
-PThreadGetSpecific<int> pthread_get_specific;
-REG(pthread_get_specific);
-boost::thread_specific_ptr<int> boost_tsp;
-REG(boost_tsp);
-BENCHMARK_DRAW_LINE();
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
-  gflags::SetCommandLineOptionWithMode(
-    "bm_max_iters", "100000000", gflags::SET_FLAG_IF_DEFAULT
-  );
-  if (FLAGS_benchmark) {
-    folly::runBenchmarks();
-  }
-  return RUN_ALL_TESTS();
+TEST(ThreadLocal, UnregisterClassHasConstExprCtor) {
+  folly::threadlocal_detail::PthreadKeyUnregisterTester x;
+  // yep!
+  SUCCEED();
 }
-
-/*
-Ran with 24 threads on dual 12-core Xeon(R) X5650 @ 2.67GHz with 12-MB caches
-
-Benchmark                               Iters   Total t    t/iter iter/sec
-------------------------------------------------------------------------------
-*       BM_mt_tlp                   100000000  39.88 ms  398.8 ps  2.335 G
- +5.91% BM_mt_pthread_get_specific  100000000  42.23 ms  422.3 ps  2.205 G
- + 295% BM_mt_boost_tsp             100000000  157.8 ms  1.578 ns  604.5 M
-------------------------------------------------------------------------------
-*/

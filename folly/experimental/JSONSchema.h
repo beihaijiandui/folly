@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2015-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 #pragma once
 
 #include <folly/ExceptionWrapper.h>
-#include <folly/dynamic.h>
 #include <folly/Range.h>
+#include <folly/dynamic.h>
 
 /**
  * Validation according to the draft v4 standard: http://json-schema.org/
@@ -68,6 +68,6 @@ std::unique_ptr<Validator> makeValidator(const dynamic& schema);
  * Makes a validator for schemas. You should probably check your schema with
  * this before you use makeValidator().
  */
-Validator* makeSchemaValidator();
-}
-}
+std::shared_ptr<Validator> makeSchemaValidator();
+} // namespace jsonschema
+} // namespace folly

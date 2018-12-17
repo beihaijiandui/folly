@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2015-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,10 @@
 // Copyright 2013-present Facebook. All Rights Reserved.
 // @author: Pavlo Kushnir (pavlo)
 
-#ifndef FOLLY_EXPERIMENTAL_STRINGKEYEDCOMMON_H_
-#define FOLLY_EXPERIMENTAL_STRINGKEYEDCOMMON_H_
+#pragma once
 
 #include <memory>
+
 #include <folly/Range.h>
 
 namespace folly {
@@ -27,18 +27,19 @@ namespace folly {
 template <class Alloc>
 StringPiece stringPieceDup(StringPiece piece, const Alloc& alloc) {
   auto size = piece.size();
-  auto keyDup = typename Alloc::template rebind<char>::other(alloc)
-    .allocate(size);
-  memcpy(keyDup, piece.data(), size * sizeof(typename StringPiece::value_type));
+  auto keyDup =
+      typename Alloc::template rebind<char>::other(alloc).allocate(size);
+  if (size) {
+    memcpy(
+        keyDup, piece.data(), size * sizeof(typename StringPiece::value_type));
+  }
   return StringPiece(keyDup, size);
 }
 
 template <class Alloc>
 void stringPieceDel(StringPiece piece, const Alloc& alloc) {
-  typename Alloc::template rebind<char>::other(alloc)
-    .deallocate(const_cast<char*>(piece.data()), piece.size());
+  typename Alloc::template rebind<char>::other(alloc).deallocate(
+      const_cast<char*>(piece.data()), piece.size());
 }
 
-} // folly
-
-#endif /* FOLLY_EXPERIMENTAL_STRINGKEYEDCOMMON_H_ */
+} // namespace folly
